@@ -1,0 +1,103 @@
+[GuiPlugIn(
+		Area = PlugInArea.AdminMenu,
+		Url = "/cms/admin/DeleteMissingProperty/Index",
+		DisplayName = "Delete missing properties")]
+	public class DeleteMissingPropertyController : Controller
+	{
+		// GET: PublishHome
+		public ActionResult Index()
+		{
+			var missingContentTypeProperties = GetMissingProperties().Select(x=>new MissingContentTypeProperty{PropertyDefinition = x}).OrderBy(x=>x.ContentTypeName).ToList();
+			return View(missingContentTypeProperties);
+		}
+
+		[HttpPost]
+		public ActionResult DoDelete(List<DeleteMissingPropertyModel> deleteMissingPropertyModel)
+		{
+			try
+			{
+				DeleteMissingProperties(deleteMissingPropertyModel);
+			}
+			catch (Exception e)
+			{
+				TempData["error"] = e.Message;
+			}
+			return RedirectToAction("Index");
+		}
+
+		/// <summary>
+		/// Delete property definitions
+		/// </summary>
+		/// <param name="propertiesToDelete"></param>
+		private void DeleteMissingProperties(List<DeleteMissingPropertyModel> propertiesToDelete)
+		{
+			var deleteTemp = propertiesToDelete.Where(x => x.IsDelete).ToList();
+			if(!deleteTemp.Any())
+				return;
+			IPropertyDefinitionRepository propertyDefinitionRepository = ServiceLocator.Current.GetInstance<IPropertyDefinitionRepository>();
+			foreach (var deleteMissingPropertyModel in deleteTemp)
+			{
+				var propertyToDelete = propertyDefinitionRepository.Load(deleteMissingPropertyModel.Id).CreateWritableClone();
+				propertyDefinitionRepository.Delete(propertyToDelete);
+			}
+		}
+
+		/// <summary>
+		/// Get all properties that are not defined in code anymore.
+		/// </summary>
+		/// <returns></returns>
+		private List<PropertyDefinition> GetMissingProperties()
+		{
+			IContentTypeRepository contentTypeRepository = ServiceLocator.Current.GetInstance<IContentTypeRepository>();
+
+			List<PropertyDefinition> propertyDefinitions = new List<PropertyDefinition>();
+
+			foreach (var type in contentTypeRepository.List())
+			{
+				foreach (var property in type.PropertyDefinitions)
+				{
+					if (IsMissingModelProperty(property)) propertyDefinitions.Add(property);
+				}
+			}
+
+			return propertyDefinitions;
+		}
+
+		/// <summary>
+		/// Is propertydefinition not defind in code?
+		/// </summary>
+		/// <param name="propertyDefinition"></param>
+		/// <returns></returns>
+		private bool IsMissingModelProperty(PropertyDefinition propertyDefinition)
+		{
+			ContentTypeModelRepository typeModelRepository = ServiceLocator.Current.GetInstance<ContentTypeModelRepository>();
+
+			return (((propertyDefinition != null) && propertyDefinition.ExistsOnModel) && (typeModelRepository.GetPropertyModel(propertyDefinition.ContentTypeID, propertyDefinition) == null));
+		}
+	}
+
+	public class MissingContentTypeProperty
+	{
+		public PropertyDefinition PropertyDefinition { get; set; }
+
+		public string ContentTypeName
+		{
+			get
+			{
+				var contentTypeRepository = ServiceLocator.Current.GetInstance<IContentTypeRepository>();
+				return contentTypeRepository.Load(PropertyDefinition.ContentTypeID).DisplayName;
+			}
+		}
+
+		public string PropertyName => PropertyDefinition.Name;
+	}
+
+	public class DeleteMissingPropertyModel
+	{
+
+		public int ContentTypeId { get; set; }
+
+		public int Id { get; set; }
+
+		public bool IsDelete { get; set; }
+	}
