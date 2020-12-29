@@ -1,56 +1,45 @@
-using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.IO;
-using System.Linq;
-using System.Runtime.Serialization.Formatters.Binary;
-using System.Text;
-using System.Threading.Tasks;
-using System.Web;
-using System.Web.Mvc;
-using System.Xml;
 using Castle.Components.DictionaryAdapter;
 using EPiServer;
 using EPiServer.Cms.Shell;
 using EPiServer.Core;
 using EPiServer.Data.Dynamic;
 using EPiServer.DataAbstraction;
-using EPiServer.DataAccess;
-using EPiServer.Find.Cms;
 using EPiServer.Forms.Core;
 using EPiServer.Forms.Core.Data;
+using EPiServer.Forms.Core.Data.Internal;
 using EPiServer.Forms.Core.Models;
 using EPiServer.Forms.Implementation.Elements;
-using EPiServer.Framework.Blobs;
 using EPiServer.PlugIn;
 using EPiServer.ServiceLocation;
 using EPiServer.Web;
-using EPiServer.Web.Routing;
 using GrantThornton.Interface.Web.Business.Extensions;
 using GrantThornton.Interface.Web.Core.Extensions;
-using GrantThornton.Interface.Web.Core.Helper;
-using GrantThornton.Interface.Web.Core.Interfaces;
-using GrantThornton.Interface.Web.Core.Services;
 using GrantThornton.Interface.Web.Models.Base;
-using GrantThornton.Interface.Web.Models.Pages;
-using GrantThornton.Interface.Web.Models.Properties;
 using GrantThornton.Interface.Web.Models.SiteDefinitions;
-using GrantThornton.Interface.Web.Models.ViewModels;
-using GrantThornton.Interface.Web.Models.ViewModels.Blocks.Location;
 using Microsoft.Scripting.Utils;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Runtime.Serialization.Formatters.Binary;
+using System.Threading.Tasks;
+using System.Web;
+using System.Web.Mvc;
+using System.Xml;
 
 namespace GrantThornton.Interface.Web.Controllers.Admin
 {
 	[GuiPlugIn(
 		Area = PlugInArea.AdminMenu,
-		Url = "/cms/admin/ExportEpiFormSubmissionData/Index",
-		DisplayName = "Export Epi Form Submission Data")]
-	public class ExportEpiFormSubmissionDataController : Controller
+		Url = "/cms/admin/ExportImportEpiFormSubmissionData/Index",
+		DisplayName = "Export Import Epi Form Submission Data")]
+	public class ExportImportEpiFormSubmissionDataController : Controller
 	{
 		private readonly IContentTypeRepository _contentTypeRepository;
 		private readonly IContentModelUsage _contentModelUsage;
 		private readonly TemplateResolver _templateResolver;
-		public ExportEpiFormSubmissionDataController(IContentTypeRepository contentTypeRepository, IContentModelUsage contentModelUsage)
+		public ExportImportEpiFormSubmissionDataController(IContentTypeRepository contentTypeRepository, IContentModelUsage contentModelUsage)
 		{
 			_contentTypeRepository = contentTypeRepository;
 			_contentModelUsage = contentModelUsage;
@@ -85,6 +74,16 @@ namespace GrantThornton.Interface.Web.Controllers.Admin
 		}
 
 		[HttpPost]
+		public async Task<ActionResult> DoExportToXml(string guidId, int homePageId)
+		{
+			var contentGuid = new Guid(guidId);
+			var exportData = new EpiFormDataExport(contentGuid, homePageId);
+			var submissionData = exportData.GetFormSubmissionXmlData();
+
+			return File(submissionData, System.Net.Mime.MediaTypeNames.Text.Xml, $"Home_{homePageId}" + ".xml");
+		}
+
+		[HttpPost]
 		public ActionResult DoImport(HttpPostedFileBase file)
 		{
 			try
@@ -94,14 +93,32 @@ namespace GrantThornton.Interface.Web.Controllers.Admin
 
 					var importSumissionData = new EpiFormDataImport(file.InputStream);
 					var isGetSubmissionData = importSumissionData.GetSubmissionDataFromStream();
+
+					var reports = importSumissionData.DoImport();
+					if (reports != null)
+					{
+						MemoryStream ms = new MemoryStream();
+						TextWriter tw = new StreamWriter(ms);
+						foreach (var importReport in reports)
+						{
+							importReport.WriteReport(tw);
+						}
+						tw.Flush();
+						byte[] bytes = ms.ToArray();
+						ms.Close();
+						Response.Clear();
+						Response.ContentType = "application/force-download";
+						Response.AddHeader("content-disposition", "attachment;filename=report.txt");
+						Response.BinaryWrite(bytes);
+						Response.End();
+					}
 				}
-				ViewBag.Message = "File Uploaded Successfully!!";
-				return View();
+				return RedirectToAction("Index");
 			}
 			catch
 			{
 				ViewBag.Message = "File upload failed!!";
-				return View();
+				return RedirectToAction("Index");
 			}
 		}
 	}
@@ -120,9 +137,15 @@ namespace GrantThornton.Interface.Web.Controllers.Admin
 		private Stream _fileStream;
 
 		private Submission[] _submissions;
+		private readonly IContentRepository _contentRepository;
+		private readonly IPermanentStorage _permanentStorate;
+		private readonly SubmissionStorageFactory _submissionStorageFactoryy;
 		public EpiFormDataImport(Stream input)
 		{
 			_fileStream = input;
+			_contentRepository = ServiceLocator.Current.GetInstance<IContentRepository>();
+			_permanentStorate = ServiceLocator.Current.GetInstance<IPermanentStorage>();
+			_submissionStorageFactoryy = ServiceLocator.Current.GetInstance<SubmissionStorageFactory>();
 		}
 
 		public bool GetSubmissionDataFromStream()
@@ -132,13 +155,138 @@ namespace GrantThornton.Interface.Web.Controllers.Admin
 				BinaryFormatter bformatter = new BinaryFormatter();
 				var results = bformatter.Deserialize(_fileStream) as Submission[];
 				if (results != null && results.Length > 0)
+				{
+					_submissions = results;
 					return true;
+				}
 				return false;
 			}
 			catch (Exception e)
 			{
 				return false;
 			}
+		}
+
+		public IEnumerable<ImportReport> DoImport()
+		{
+			var reports = new List<ImportReport>();
+			var reportItem = new ImportReport();
+			reports.Add(reportItem);
+			try
+			{
+				var dataToImports = ConvertToSubmissionImport();
+				reportItem.SetInfo(dataToImports);
+
+				foreach (var contentToImport in dataToImports)
+				{
+					var reportItemSubmission = new ImportReport();
+					try
+					{
+						var formIdentity = new FormIdentity(contentToImport.ContentGuid, contentToImport.Language);
+						var submissionStorage = _submissionStorageFactoryy.GetStorage(formIdentity);
+						var submissionData = submissionStorage.SaveToStorage(formIdentity, contentToImport.Submission);
+						reportItemSubmission.SetSuccessMessage(contentToImport);
+					}
+					catch (Exception e)
+					{
+						reportItemSubmission.SetErrorMessage(contentToImport, e.Message);
+					}
+					reports.Add(reportItemSubmission);
+				}
+			}
+			catch (Exception ex)
+			{
+				reportItem.SetInfo(ex.Message);
+			}
+			return reports;
+		}
+
+
+		private IEnumerable<ContentToImport> ConvertToSubmissionImport()
+		{
+			var contentToImports = _submissions.Select(x => GetContentToImport(x));
+			return contentToImports;
+		}
+
+		private ContentToImport GetContentToImport(Submission input)
+		{
+			var arrayString = input.Id.Split(':');
+			Guid formContentGuid = Guid.Empty;
+			string language = string.Empty;
+			if (!string.IsNullOrEmpty(arrayString[1]))
+			{
+				formContentGuid = new Guid(arrayString[1]);
+			}
+			if (!string.IsNullOrEmpty(arrayString[0]))
+			{
+				language = arrayString[0];
+			}
+			var submission = GetSubmission(input);
+			return new ContentToImport
+			{
+				ContentGuid = formContentGuid,
+				Language = language,
+				Submission = submission
+			};
+		}
+
+		private Submission GetSubmission(Submission input)
+		{
+			return new Submission
+			{
+				Id = Guid.NewGuid().ToString(),
+				Data = ConvertFieldIntToGuid(input.Data)
+			};
+		}
+
+		private IDictionary<string, object> ConvertFieldIntToGuid(IDictionary<string, object> inputDictionary)
+		{
+
+			var newDictionary = new Dictionary<string, object>();
+			var lang = string.Empty;
+			if (inputDictionary.ContainsKey(EPiServer.Forms.Constants.SYSTEMCOLUMN_Language))
+			{
+				lang = inputDictionary[EPiServer.Forms.Constants.SYSTEMCOLUMN_Language].ToString();
+			}
+			foreach (var dicItem in inputDictionary)
+			{
+				if (EpiFormDataExport.IsFieldElement(dicItem.Key))
+				{
+					var contentId = GetContentFromField(dicItem.Key, lang);
+					if (!string.IsNullOrEmpty(contentId))
+					{
+						newDictionary.Add($"{EpiFormDataExport._formFieldString}{contentId}", dicItem.Value);
+					}
+				}
+				else if (EpiFormDataExport.IsSYSTEMCOLUMNHostedPageField(dicItem.Key))
+				{
+					var contentId = GetContentFromField(dicItem.Value.ToString(), lang);
+					if (!string.IsNullOrEmpty(contentId))
+					{
+						newDictionary.Add(EPiServer.Forms.Constants.SYSTEMCOLUMN_HostedPage, contentId);
+					}
+				}
+				else
+				{
+					newDictionary.Add(dicItem.Key, dicItem.Value);
+				}
+			}
+			return newDictionary;
+		}
+
+		private string GetContentFromField(string input, string lang)
+		{
+			var contentIdString = input.Replace(EpiFormDataExport._formFieldString, string.Empty);
+			Guid contentId;
+			if (Guid.TryParse(contentIdString, out contentId))
+			{
+				IContent page;
+				if (_contentRepository.TryGet(contentId, new CultureInfo(lang), out page))
+				{
+					return page.ContentLink.ID.ToString();
+				}
+			}
+			return string.Empty;
 		}
 	}
 
@@ -153,7 +301,7 @@ namespace GrantThornton.Interface.Web.Controllers.Admin
 		private ContentReference _homePage;
 		private ContentType _formContentType;
 		private int _maxLevelToGet = 5;
-		private string _formFieldString = "__field_";
+		public static string _formFieldString = "__field_";
 		public EpiFormDataExport(Guid formTypeId, int homePageId)
 		{
 			_formTypeId = formTypeId;
@@ -172,6 +320,15 @@ namespace GrantThornton.Interface.Web.Controllers.Admin
 			var formContents = GetFormContent(pageDescendants);
 			var submissionData = GetSubmissionDatas(formContents);
 			var sumissionResult = SerializeSubmission(submissionData.ToArray());
+			return sumissionResult;
+		}
+
+		public byte[] GetFormSubmissionXmlData()
+		{
+			var pageDescendants = GetPageDescendants();
+			var formContents = GetFormContent(pageDescendants);
+			var submissionData = GetSubmissionDatas(formContents);
+			var sumissionResult = WriteSubmissionsToXml(submissionData.ToArray());
 			return sumissionResult;
 		}
 
@@ -196,7 +353,7 @@ namespace GrantThornton.Interface.Web.Controllers.Admin
 			using (var ms = new MemoryStream())
 			{
 				XmlWriter xmlWriter = XmlWriter.Create(ms, settings);
-
+				xmlWriter.WriteStartElement("submissions");
 				foreach (var submission in submissions)
 				{
 
@@ -204,6 +361,7 @@ namespace GrantThornton.Interface.Web.Controllers.Admin
 					submission.WriteXml(xmlWriter);
 					xmlWriter.WriteEndElement();
 				}
+				xmlWriter.WriteEndElement();
 				xmlWriter.Flush();
 				fileContent = ms.GetBuffer();
 			}
@@ -348,13 +506,15 @@ namespace GrantThornton.Interface.Web.Controllers.Admin
 
 		private IEnumerable<Submission> GetSubmissionEachContentItem(IContent contentDatas)
 		{
-			var formIdentity = new FormIdentity(contentDatas.ContentGuid, contentDatas.LanguageBranch());
+			var contentLanguage = contentDatas.LanguageBranch();
+			var contentGuid = contentDatas.ContentGuid;
+			var formIdentity = new FormIdentity(contentGuid, contentLanguage);
 			var submissionData = _permanentStorate.LoadSubmissionFromStorage(formIdentity, DateTime.MinValue, DateTime.MaxValue);
 			if (submissionData != null)
 			{
 				var submissionConvert = submissionData.Select(x => new Submission
 				{
-					Id = contentDatas.ContentGuid.ToString(),
+					Id = $"{contentLanguage}:{contentGuid.ToString()}",
 					Data = ConvertFieldIntToGuid(x.ToPropertyBag())
 				});
 				return submissionConvert;
@@ -412,15 +572,57 @@ namespace GrantThornton.Interface.Web.Controllers.Admin
 			return string.Empty;
 		}
 
-		private bool IsSYSTEMCOLUMNHostedPageField(string input)
+		public static bool IsSYSTEMCOLUMNHostedPageField(string input)
 		{
 			return input == EPiServer.Forms.Constants.SYSTEMCOLUMN_HostedPage;
 		}
 
-		private bool IsFieldElement(string input)
+		public static bool IsFieldElement(string input)
 		{
 			return input.Contains(_formFieldString);
 		}
+
+	}
+
+	public class ContentToImport
+	{
+		public Guid ContentGuid { get; set; }
+		public string Language { get; set; }
+		public Submission Submission { get; set; }
+	}
+
+	public class ImportReport
+	{
+		public void WriteReport(TextWriter tw)
+		{
+			if (!string.IsNullOrEmpty(Info))
+				tw.WriteLine(Info);
+			if (!string.IsNullOrEmpty(Error))
+				tw.WriteLine(Error);
+			if (!string.IsNullOrEmpty(Success))
+				tw.WriteLine(Success);
+		}
+		public void SetInfo(IEnumerable<ContentToImport> contentToImports)
+		{
+			Info = $"Total item to import: {contentToImports.Count()}";
+		}
+		public void SetInfo(string inputString)
+		{
+			Info = inputString;
+		}
+
+		public void SetSuccessMessage(ContentToImport contentToImport)
+		{
+			Success = $"Success: save success SubmissionId: {contentToImport.Submission.Id}   Formid: {contentToImport.ContentGuid}   Language: {contentToImport.Language}";
+		}
+
+		public void SetErrorMessage(ContentToImport contentToImport, string exception = "")
+		{
+			Error = $"Error: failed to save SubmissionId: {contentToImport.Submission.Id}   Formid: {contentToImport.ContentGuid}   Language: {contentToImport.Language}   Exception: {exception}";
+		}
+		public string Info { get; set; }
+		public string Error { get; set; }
+		public string Success { get; set; }
 
 	}
 }
